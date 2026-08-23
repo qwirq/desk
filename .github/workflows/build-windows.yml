@@ -1,35 +1,45 @@
 name: build-qwirq-desk-windows
 
-# The heavy build: RustDesk's Windows client is Rust + Flutter + a large vcpkg dependency tree
-# (libvpx, libyuv, opus, aom, ...). This workflow is cribbed from upstream's own Windows CI shape;
-# the first run WILL need babysitting (vcpkg cache warmup, Flutter version pin), which is expected
-# and is exactly why the build lives in CI and not in a developer's shell.
-#
-# Manual dispatch only — never on push. A tag bump is a deliberate, watched event, not something to
-# trigger accidentally while iterating on the customization script.
+# Builds qwirq-desk: RustDesk's Windows Flutter client at a pinned tag, with our customization
+# applied (rendezvous + key baked in, public fallback removed). Ported faithfully from RustDesk's
+# own flutter-build.yml + bridge.yml — the bridge codegen is inlined so this is one self-contained
+# job. Manual dispatch only; the build is heavy (vcpkg ffmpeg static + Flutter + Rust ~ 40-60 min).
 on:
   workflow_dispatch:
     inputs:
       rustdesk_tag:
-        description: "upstream rustdesk/rustdesk tag to build from"
+        description: "upstream rustdesk/rustdesk tag"
         required: true
         default: "1.4.9"
 
 env:
-  # Where the built client points. These are the ONLY QWIRQ-specific values; everything else is
-  # stock upstream. QWIRQ_PUBKEY is not a secret (every client carries it), but it is kept in repo
-  # variables rather than hardcoded so a hub key rotation is a settings change, not a code change.
-  QWIRQ_RENDEZVOUS: ${{ vars.QWIRQ_RENDEZVOUS || 'remote.qwirq.com' }}
-  QWIRQ_PUBKEY: ${{ vars.QWIRQ_PUBKEY }}
+  RUST_VERSION: "1.75"                 # sciter/ABI pin, per upstream
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # The only QWIRQ-specific values. Not secret (every client carries the pubkey); kept as env so a
+  # hub key rotation is a one-line change, not a code edit.
+  QWIRQ_RENDEZVOUS: "remote.qwirq.com"
+  QWIRQ_PUBKEY: "KqTebc3Hye2GkYFiyiS89W46lmSaSXtkrzi4eEzb8+Q="
 
 jobs:
   build:
     runs-on: windows-2022
     steps:
-      - name: Check out this build repo
+      - name: Checkout qwirq/desk (for customize.sh)
         uses: actions/checkout@v4
 
-      - name: Check out upstream RustDesk at the pinned tag (with submodules)
+      - name: Export GitHub Actions cache env (vcpkg binary cache)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout upstream RustDesk at the pinned tag (submodules)
         uses: actions/checkout@v4
         with:
           repository: rustdesk/rustdesk
@@ -37,32 +47,96 @@ jobs:
           submodules: recursive
           path: upstream
 
-      - name: Apply the QWIRQ customization (2 constants + updater off + branding)
+      - name: Apply the QWIRQ customization (rendezvous + key; remove public fallback)
+        shell: bash
+        working-directory: upstream
+        run: bash "${GITHUB_WORKSPACE}/scripts/customize.sh"
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Replace Flutter engine with RustDesk's custom x64 engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          $engine = "C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/"
+          Move-Item -Force windows-x64-release/* $engine
+
+      - name: Patch Flutter (3.24 dropdown filter, from upstream)
         shell: bash
         working-directory: upstream
         run: |
-          test -n "$QWIRQ_PUBKEY" || { echo "set the QWIRQ_PUBKEY repo variable first"; exit 1; }
-          bash "${GITHUB_WORKSPACE}/scripts/customize.sh"
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$(dirname "$(dirname "$(which flutter)")")"
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff || echo "patch already applied or not needed"
 
-      # --- from here down mirrors upstream's Windows build; pins get verified on the first run ---
-      - name: Rust toolchain
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Flutter
-        uses: subosito/flutter-action@v2
-        with: { channel: stable }
-      - name: vcpkg deps (libvpx/libyuv/opus/aom)
-        shell: bash
-        working-directory: upstream
-        run: echo "TODO(first-run): wire vcpkg per upstream .github/workflows — the map is in their repo"
-      - name: Build
-        shell: bash
-        working-directory: upstream
-        run: echo "TODO(first-run): flutter build windows / cargo build --release per upstream"
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
 
-      - name: Sign (self-signed QWIRQ cert — see qwirq/link signing decision)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream
+
+      - name: Setup vcpkg (GitHub Actions binary cache)
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies (x64-windows-static)
+        shell: bash
+        working-directory: upstream
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed" || {
+            find "$VCPKG_ROOT/" -name "*.log" -exec sh -c 'echo "== $1"; cat "$1"' _ {} \; ; exit 1; }
+
+      - name: Bridge codegen (flutter_rust_bridge)
+        shell: bash
+        working-directory: upstream
+        run: |
+          cargo install cargo-expand --version "${CARGO_EXPAND_VERSION}" --locked
+          cargo install flutter_rust_bridge_codegen --version "${FLUTTER_RUST_BRIDGE_VERSION}" --features uuid --locked
+          pushd flutter && flutter pub get && popd
+          "$HOME/.cargo/bin/flutter_rust_bridge_codegen" --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+
+      - name: Build qwirq-desk
         shell: pwsh
-        run: echo "TODO: import the QWIRQ code-signing cert from the vault and Set-AuthenticodeSignature"
+        working-directory: upstream
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec
+          Move-Item -Force .\flutter\build\windows\x64\runner\Release .\qwirq-desk
 
-      - name: Publish artifact + SHA-256
-        shell: bash
-        run: echo "TODO(first-run): upload qwirq-desk.exe to qwirq/desk-releases with its sha256"
+      - name: Package
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          Compress-Archive -Path .\qwirq-desk\* -DestinationPath qwirq-desk-windows-x64.zip
+          (Get-FileHash qwirq-desk-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  qwirq-desk-windows-x64.zip" | Out-File -Encoding ascii SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwirq-desk-windows-x64
+          path: |
+            upstream/qwirq-desk-windows-x64.zip
+            upstream/SHA256SUMS
+          retention-days: 14
