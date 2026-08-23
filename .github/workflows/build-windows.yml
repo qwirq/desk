@@ -1,0 +1,68 @@
+name: build-qwirq-desk-windows
+
+# The heavy build: RustDesk's Windows client is Rust + Flutter + a large vcpkg dependency tree
+# (libvpx, libyuv, opus, aom, ...). This workflow is cribbed from upstream's own Windows CI shape;
+# the first run WILL need babysitting (vcpkg cache warmup, Flutter version pin), which is expected
+# and is exactly why the build lives in CI and not in a developer's shell.
+#
+# Manual dispatch only — never on push. A tag bump is a deliberate, watched event, not something to
+# trigger accidentally while iterating on the customization script.
+on:
+  workflow_dispatch:
+    inputs:
+      rustdesk_tag:
+        description: "upstream rustdesk/rustdesk tag to build from"
+        required: true
+        default: "1.4.9"
+
+env:
+  # Where the built client points. These are the ONLY QWIRQ-specific values; everything else is
+  # stock upstream. QWIRQ_PUBKEY is not a secret (every client carries it), but it is kept in repo
+  # variables rather than hardcoded so a hub key rotation is a settings change, not a code change.
+  QWIRQ_RENDEZVOUS: ${{ vars.QWIRQ_RENDEZVOUS || 'remote.qwirq.com' }}
+  QWIRQ_PUBKEY: ${{ vars.QWIRQ_PUBKEY }}
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out this build repo
+        uses: actions/checkout@v4
+
+      - name: Check out upstream RustDesk at the pinned tag (with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ github.event.inputs.rustdesk_tag }}
+          submodules: recursive
+          path: upstream
+
+      - name: Apply the QWIRQ customization (2 constants + updater off + branding)
+        shell: bash
+        working-directory: upstream
+        run: |
+          test -n "$QWIRQ_PUBKEY" || { echo "set the QWIRQ_PUBKEY repo variable first"; exit 1; }
+          bash "${GITHUB_WORKSPACE}/scripts/customize.sh"
+
+      # --- from here down mirrors upstream's Windows build; pins get verified on the first run ---
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Flutter
+        uses: subosito/flutter-action@v2
+        with: { channel: stable }
+      - name: vcpkg deps (libvpx/libyuv/opus/aom)
+        shell: bash
+        working-directory: upstream
+        run: echo "TODO(first-run): wire vcpkg per upstream .github/workflows — the map is in their repo"
+      - name: Build
+        shell: bash
+        working-directory: upstream
+        run: echo "TODO(first-run): flutter build windows / cargo build --release per upstream"
+
+      - name: Sign (self-signed QWIRQ cert — see qwirq/link signing decision)
+        shell: pwsh
+        run: echo "TODO: import the QWIRQ code-signing cert from the vault and Set-AuthenticodeSignature"
+
+      - name: Publish artifact + SHA-256
+        shell: bash
+        run: echo "TODO(first-run): upload qwirq-desk.exe to qwirq/desk-releases with its sha256"
