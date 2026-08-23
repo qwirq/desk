@@ -67,12 +67,16 @@ jobs:
       - name: Replace Flutter engine with RustDesk's custom x64 engine
         shell: pwsh
         run: |
-          flutter doctor -v
           flutter precache --windows
           Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
-          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
-          $engine = "C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/"
-          Move-Item -Force windows-x64-release/* $engine
+          Expand-Archive -Force -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          # Derive the Flutter root from `flutter` itself — subosito's install path is not fixed.
+          $flutterBin = (Get-Command flutter).Source
+          $root = Split-Path (Split-Path $flutterBin)
+          $engine = Join-Path $root "bin\cachertifacts\engine\windows-x64-release"
+          New-Item -ItemType Directory -Force -Path $engine | Out-Null
+          Copy-Item -Force -Recurse windows-x64-release\* $engine
+          Write-Host "engine dir: $engine"; Get-ChildItem $engine | Select-Object -ExpandProperty Name | Select-Object -First 8
 
       - name: Patch Flutter (3.24 dropdown filter, from upstream)
         shell: bash
