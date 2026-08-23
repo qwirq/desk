@@ -73,9 +73,9 @@ jobs:
           # Derive the Flutter root from `flutter` itself — subosito's install path is not fixed.
           $flutterBin = (Get-Command flutter).Source
           $root = Split-Path (Split-Path $flutterBin)
-          $engine = Join-Path $root "bin\cachertifacts\engine\windows-x64-release"
+          $engine = Join-Path $root "bin/cache/artifacts/engine/windows-x64-release"
           New-Item -ItemType Directory -Force -Path $engine | Out-Null
-          Copy-Item -Force -Recurse windows-x64-release\* $engine
+          Copy-Item -Force -Recurse windows-x64-release/* $engine
           Write-Host "engine dir: $engine"; Get-ChildItem $engine | Select-Object -ExpandProperty Name | Select-Object -First 8
 
       - name: Patch Flutter (3.24 dropdown filter, from upstream)
